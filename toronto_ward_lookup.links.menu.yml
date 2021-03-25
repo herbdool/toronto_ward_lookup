@@ -1,0 +1,6 @@
+toronto_ward_lookup.admin:
+  title: 'Toronto Ward Lookup Batch'
+  description: 'Batch processing for assigning wards to all CiviCRM contacts.'
+  parent: system.admin_config_development
+  route_name: toronto_ward_lookup_batch.content
+  weight: 100

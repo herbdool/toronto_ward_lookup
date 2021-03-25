@@ -1,0 +1,7 @@
+toronto_ward_lookup_batch.content:
+  path: '/admin/config/development/toronto_ward_lookup_batch'
+  defaults:
+    _controller: '\Drupal\toronto_ward_lookup\Controller\BatchController::content'
+    _title: 'Toronto Ward Lookup Batch'
+  requirements:
+    _permission: 'administer CiviCRM'

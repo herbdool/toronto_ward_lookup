@@ -1,0 +1,389 @@
+<?php
+/**
+ * @file
+ * Provides search capability where a provided street address is mapped to its Toronto ward.
+ */
+
+define('TORONTO_WARD_URL_PREFIX',"ward/"); # Make urls by adding the ward number to this.
+define('TORONTO_WARD_FAIL_REDIRECT',"wards"); # Redirect if ward lookup fails.
+
+/**
+ * Returns a single ward number, or FALSE.
+ * Used to assign a ward number to a CiviCRM contact
+ *
+ * @param array $geocodes
+ * @return int|FALSE
+ */
+function toronto_ward_lookup_geocodes($geocodes) {
+  if (!is_array($geocodes)) {
+    return false;
+  }
+
+  $boundary = toronto_ward_lookup_boundaries_by_geocodes($geocodes, 'toronto-wards-2018');
+
+  if (!isset($boundary['toronto-wards-2018'][0])) {
+    return false;
+  }
+
+  $ward_id = NULL;
+  $ward_id = (int) $boundary['toronto-wards-2018'][0]->external_id;
+
+  return $ward_id;
+}
+
+/**
+ * Get all wards associated with the postal code.
+ *
+ * @param string $postal_string
+ * @param boolean $strict
+ *
+ * @return array|int
+ */
+function toronto_ward_lookup_postalcode($postal_string, $strict = FALSE) {
+  $postal_code = represent_format_postal_code($postal_string);
+  $boundaries = represent_boundaries_by_postal_code($postal_code, 'toronto-wards-2018');
+
+  if (!isset($boundaries['toronto-wards-2018'])) {
+    return false;
+  }
+
+  $wards = [];
+  foreach ($boundaries['toronto-wards-2018'] as $district) {
+    $ward_id = NULL;
+    $ward_id = (int) $district->external_id;
+    if (!empty($ward_id)) {
+      $wards[] = $ward_id;
+    }
+  }
+
+  if ($strict) {
+    return $wards[0];
+  } else {
+    return $wards;
+  }
+}
+
+/**
+ * Implements hook_cron()
+ *
+ * Update Ward number based on street address and if that is blank,
+ * try postal code.
+ */
+function toronto_ward_lookup_cron( ) {
+  civicrm_initialize( true );
+  // Get last time this was run. If empty then use last week.
+  $last_run = \Drupal::state()
+    ->get('toronto_ward_lookup.last_run', REQUEST_TIME - (7 * 24 * 60 * 60));
+  $last_run_formatted = date('Y-m-d H:i:s', $last_run);
+
+  $updated_home_ward_count = 0;
+  $updated_multi_wards_count = 0;
+
+  // get all street addresses that don't have wards assigned
+  $queryEmptyWards = '
+  SELECT DISTINCT a.contact_id, a.geo_code_1, a.geo_code_2, a.postal_code
+  FROM civicrm_address a
+  JOIN civicrm_contact c ON (a.contact_id = c.id)
+  JOIN civicrm_log l ON (a.contact_id = l.modified_id)
+  WHERE a.is_primary = 1
+  AND c.is_deleted = 0
+  AND (a.street_address IS NOT NULL
+  OR a.postal_code REGEXP "^M[[:digit:]][ABCEGHJKLMNPRSTVXY]")
+  AND l.entity_table = "civicrm_contact"
+  AND l.modified_date >= "' . $last_run_formatted . '";
+  ';
+
+  $dao = \CRM_CORE_DAO::executeQuery( $queryEmptyWards );
+
+  while ($dao->fetch()) {
+    if (!empty($dao->geo_code_1) && !empty($dao->geo_code_2)) {
+      $geocodes = [$dao->geo_code_1, $dao->geo_code_2];
+      $ward_number = toronto_ward_lookup_geocodes($geocodes);
+    }
+    if ((!isset($ward_number) || !$ward_number) && !empty($dao->postal_code)) {
+      // No luck with street address so try postal code
+      // Pluck just the first of wards
+      $ward_numbers = toronto_ward_lookup_postalcode($dao->postal_code);
+      if (count($ward_numbers) == 1) {
+        $ward_number = $ward_numbers[0];
+      }
+    }
+    if (!empty($ward_number) && $dao->contact_id) {
+      // Update/Insert the ward number
+      if (_update_home_ward($dao->contact_id, $ward_number)) {
+        $updated_home_ward_count += 1;
+      }
+      if (_update_multi_wards($dao->contact_id, $ward_number)) {
+        $updated_multi_wards_count += 1;
+      }
+    }
+    if (!empty($ward_numbers)) {
+      $update_multi_wards = FALSE;
+      // Add all wards that overlap postal code
+      // but only if street address turns up nothing.
+      foreach ($ward_numbers as $wn) {
+        $update_multi_wards = _update_multi_wards($dao->contact_id, $wn);
+      }
+      if ($update_multi_wards) {
+        // if any ward numbers added increase count
+        $updated_multi_wards_count += 1;
+      }
+    }
+  }
+  if ($updated_home_ward_count > 0) {
+    watchdog('civicrm', 'CiviCRM Home Ward records: %wards updated.', ['%wards' => $updated_home_ward_count], WATCHDOG_NOTICE, NULL);
+    watchdog('civicrm', 'CiviCRM Multi Ward records: %wards updated.', ['%wards' => $updated_multi_wards_count], WATCHDOG_NOTICE, NULL);
+  }
+  \Drupal::state()
+    ->set('toronto_ward_lookup.last_run', REQUEST_TIME);
+}
+
+/**
+ * Callback for batch processing items.
+ */
+function toronto_ward_lookup_address_process($progress, $limit, &$context) {
+  civicrm_initialize();
+  $updated_count = 0;
+
+  $addresses = _toronto_ward_lookup_all_addresses($progress, $limit);
+  foreach ($addresses as $address) {
+    if (!empty($address['latitude']) && !empty($address['longitude'])) {
+      $geocodes = [$address['latitude'], $address['longitude']];
+      $ward_number = toronto_ward_lookup_geocodes($geocodes);
+    }
+    if ((!isset($ward_number) || !$ward_number) && !empty($address['postal_code'])) {
+      // No luck with street address so try postal code
+      // Pluck just the first of wards
+      $ward_numbers = toronto_ward_lookup_postalcode($address['postal_code']);
+      if (count($ward_numbers) == 1) {
+        $ward_number = $ward_numbers[0];
+      }
+    }
+    if (!empty($ward_number) && !empty($address['contact_id'])) {
+      // Update/Insert the ward number
+      _update_home_ward($address['contact_id'], $ward_number);
+      _update_multi_wards($address['contact_id'], $ward_number);
+      $updated_count++;
+    }
+    if (!empty($ward_numbers)) {
+      // Add all wards that overlap postal code
+      // but only if street address turns up nothing.
+      foreach ($ward_numbers as $wn) {
+        _update_multi_wards($address['contact_id'], $wn);
+      }
+      $updated_count++;
+    }
+  }
+
+  // update progress for message
+  $progress = $progress + $limit;
+  // update message during each run so you know where you are in the process
+  $updated = isset($context['results']['updated']) ? $context['results']['updated'] : 0;
+  $context['message'] = 'Now processing ' . $progress . ' - ' . $updated . ' updated';
+  $context['results']['updated'] = $updated + $updated_count;
+}
+
+/**
+* Callback for finished batch.
+*/
+function toronto_ward_lookup_batch_finished($success, $results, $operations) {
+  $messenger = \Drupal::messenger();
+  if ($success) {
+    //retrieve final number in toronto_ward_lookup_batch_finished()
+    $messenger->addMessage(t('@count results processed.', ['@count' => $results['updated']]));
+  } else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', [
+      '%error_operation' => $error_operation[0],
+      '@arguments' => print_r($error_operation[1], TRUE)
+    ]);
+    $messenger->addMessage($message, 'error');
+  }
+}
+
+/**
+ * Utility function - queries all addresses.
+ *
+ * @return object
+ *   An object result of database query.
+ */
+function _toronto_ward_lookup_all_addresses($progress, $limit) {
+  civicrm_initialize();
+  // get all street addresses that look like they might be in Toronto.
+
+  $queryAddresses = '
+  SELECT DISTINCT a.contact_id, a.geo_code_1, a.geo_code_2, a.postal_code
+  FROM civicrm_address a
+  JOIN civicrm_contact c ON (a.contact_id = c.id)
+  WHERE a.is_primary = 1
+  AND c.is_deleted = 0
+  AND (a.street_address IS NOT NULL
+  OR a.postal_code REGEXP "^M[[:digit:]][ABCEGHJKLMNPRSTVXY]")
+  LIMIT ' . $progress . ',' . $limit . ';
+  ';
+  $dao = CRM_CORE_DAO::executeQuery( $queryAddresses );
+
+  while ($dao->fetch()) {
+    $lookup[$dao->contact_id]['contact_id'] = $dao->contact_id;
+    $lookup[$dao->contact_id]['postal_code'] = $dao->postal_code;
+    $lookup[$dao->contact_id]['latitude'] = $dao->geo_code_1;
+    $lookup[$dao->contact_id]['longitude'] = $dao->geo_code_2;
+  }
+
+  return $lookup;
+}
+
+/**
+ * Utility function - queries number of Toronto addresses.
+ *
+ * @return int
+ *   A count of Toronto addresses.
+ */
+function _toronto_ward_lookup_count_addresses() {
+  civicrm_initialize();
+  // get all street addresses that look like they might be in Toronto.
+  $queryAddresses = '
+  SELECT DISTINCT count(a.contact_id)
+  FROM civicrm_address a
+  JOIN civicrm_contact c ON (a.contact_id = c.id)
+  WHERE a.is_primary = 1
+  AND c.is_deleted = 0
+  AND (a.street_address IS NOT NULL
+  OR a.postal_code REGEXP "^M[[:digit:]][ABCEGHJKLMNPRSTVXY]");
+  ';
+
+  return CRM_CORE_DAO::SingleValueQuery( $queryAddresses );
+}
+
+/*
+ * Check and update ward multi field.
+ *
+ * @param integer $contact_id
+ * @param integer $ward_number
+ * @param string $entity
+ */
+function _update_multi_wards($contact_id, $ward_number, $entity_name = '') {
+  // First get current wards from field.
+  $params = [
+    'version' => 3,
+    'sequential' => 1,
+    'entity_id' => $contact_id,
+    'return.custom_32' => 1,
+  ];
+  $getWards = civicrm_api('CustomValue', 'get', $params);
+  if (isset($getWards['count']) && $getWards['count'] > 0) {
+    $currentWards = (is_array($getWards['values'][0][0])) ? $getWards['values'][0][0] : [$getWards['values'][0][0]];
+  } else {
+    $currentWards = [];
+  }
+
+  // If ward number is not already in array insert it
+  if (!in_array($ward_number, $currentWards)) {
+    $currentWards[] = $ward_number;
+    sort($currentWards);
+    $params = [
+      'version' => 3,
+      'sequential' => 1,
+      'entity_id' => $contact_id,
+      'custom_32' => $currentWards,
+    ];
+    $updateWards = civicrm_api('CustomValue', 'create', $params);
+
+    if ($updateWards['count'] > 0) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/*
+ * Check and update ward home field.
+ *
+ * @param integer $contact_id
+ * @param integer $ward_number
+ * @param string $entity
+ */
+function _update_home_ward($contact_id, $ward_number, $entity_name = '') {
+  // First get current ward from field.
+  $params = [
+    'version' => 3,
+    'sequential' => 1,
+    'entity_id' => $contact_id,
+    'return.custom_28' => 1,
+  ];
+  $getWard = civicrm_api('CustomValue', 'get', $params);
+  if (isset($getWard['values'][0][0]) && $getWard['values'][0][0] == $ward_number) {
+    return FALSE;
+  }
+  // Insert the ward based on current address. We don't care about previous value.
+  $params = [
+    'version' => 3,
+    'sequential' => 1,
+    'entity_id' => $contact_id,
+    'custom_28' => $ward_number,
+  ];
+  $updateWard = civicrm_api('CustomValue', 'create', $params);
+  if ($updateWard['count'] > 0) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Returns the boundaries containing the given geocode and belonging to one
+ * one of the given boundary sets.
+ *
+ * @param array $geocodes
+ *   Latitude / Longitude
+ * @param array $sets (optional)
+ *   Machine names of resource sets, eg "federal-electoral-districts"
+ * @return array
+ *   Matching boundaries
+ */
+function toronto_ward_lookup_boundaries_by_geocodes($geocodes, $sets = []) {
+  return toronto_ward_lookup_resources_by_geocodes($geocodes, 'boundaries', 'boundary', $sets);
+}
+
+/**
+ * @param array $geocodes
+ *   Latitude / Longitude
+ * @param array $sets (optional)
+ *   Machine names of resource sets, eg "house-of-commons" or
+ *   "federal-electoral-districts"
+ * @param string $plural
+ *   The plural resource name
+ * @param string $singular
+ *   The singular resource name
+ * @return array|FALSE
+ *   The matching resources
+ */
+function toronto_ward_lookup_resources_by_geocodes($geocodes, $plural, $singular, $sets = []) {
+  if (empty($geocodes) || !is_array($geocodes)) {
+    return FALSE;
+  }
+  if (empty($geocodes[0]) && empty($geocodes[1])) {
+    return FALSE;
+  }
+  $geocodes = implode(',', $geocodes);
+
+  // Get the JSON response.
+  $json = represent_send_request("boundaries/?contains=${geocodes}");
+
+  // Find the matching resources.
+  $matches = [];
+  if ($json) {
+    $set_field = "${singular}_set_url";
+    if (!is_array($sets)) {
+      $sets = [$sets];
+    }
+
+    foreach ($json->objects as $match) {
+      $set = represent_get_machine_name($match->related->$set_field);
+      if (empty($sets) || in_array($set, $sets)) {
+        $matches[$set][] = $match;
+      }
+    }
+  }
+  return $matches;
+}

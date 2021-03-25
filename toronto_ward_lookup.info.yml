@@ -1,0 +1,9 @@
+name: Toronto Ward Lookup
+description: Lookup a Toronto Ward by address.
+package: CycleTO
+type: module
+version: 1.0
+core: 8.x
+dependencies:
+  - represent:represent
+  - civicrm:civicrm
